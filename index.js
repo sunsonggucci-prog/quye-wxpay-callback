@@ -36,20 +36,6 @@ function xmlFail(msg = 'fail') {
   return `<xml><ErrCode>1</ErrCode><ErrMsg><![CDATA[${msg}]]></ErrMsg></xml>`
 }
 
-function normalizeNumber(v, fallback = 0) {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : fallback
-}
-
-function getPackCountByProductId(productId) {
-  const map = {
-    pack_5: 5,
-    pack_11: 11,
-    pack_24: 24
-  }
-  return map[productId] || 0
-}
-
 async function parseIncomingBody(req) {
   let rawBuffer
 
@@ -100,99 +86,6 @@ async function parseIncomingBody(req) {
   return null
 }
 
-async function markOrderPaidByPush(payload) {
-  const outTradeNo = payload.OutTradeNo || ''
-  const openid = payload.OpenId || ''
-  const env = normalizeNumber(payload.Env, 0)
-  const goodsInfo = payload.GoodsInfo || {}
-  const wxPayInfo = payload.WeChatPayInfo || {}
-
-  const productId = goodsInfo.ProductId || ''
-  const quantity = normalizeNumber(goodsInfo.Quantity, 1)
-
-  if (!outTradeNo) {
-    throw new Error('OutTradeNo missing')
-  }
-
-  const orderCollection = db.collection('xpay_orders')
-  const orderRes = await orderCollection.where({
-    outTradeNo
-  }).limit(1).get()
-
-  if (!orderRes.data || orderRes.data.length === 0) {
-    await orderCollection.add({
-      data: {
-        outTradeNo,
-        openid,
-        env,
-        productId,
-        buyQuantity: quantity,
-        packCount: getPackCountByProductId(productId),
-        status: 'PAID',
-        granted: false,
-        transactionId: wxPayInfo.TransactionId || '',
-        mchOrderNo: wxPayInfo.MchOrderNo || '',
-        paidTime: normalizeNumber(wxPayInfo.PaidTime, 0),
-        actualPrice: normalizeNumber(goodsInfo.ActualPrice, 0),
-        origPrice: normalizeNumber(goodsInfo.OrigPrice, 0),
-        attach: goodsInfo.Attach || '',
-        pushPayload: payload,
-        createdFrom: 'push_backfill',
-        updatedAt: Date.now(),
-        createdAt: Date.now()
-      }
-    })
-
-    console.log('markOrderPaidByPush: order not found, backfill created, outTradeNo =', outTradeNo)
-    return
-  }
-
-  const order = orderRes.data[0]
-
-  await orderCollection.doc(order._id).update({
-    data: {
-      status: 'PAID',
-      transactionId: wxPayInfo.TransactionId || order.transactionId || '',
-      mchOrderNo: wxPayInfo.MchOrderNo || order.mchOrderNo || '',
-      paidTime: normalizeNumber(wxPayInfo.PaidTime, order.paidTime || 0),
-      actualPrice: normalizeNumber(goodsInfo.ActualPrice, order.actualPrice || 0),
-      origPrice: normalizeNumber(goodsInfo.OrigPrice, order.origPrice || 0),
-      attach: goodsInfo.Attach || order.attach || '',
-      pushPayload: payload,
-      updatedAt: Date.now()
-    }
-  })
-
-  console.log('markOrderPaidByPush: order updated to PAID, outTradeNo =', outTradeNo)
-}
-
-async function markOrderRefundedByPush(payload) {
-  const outTradeNo = payload.MchOrderId || ''
-  if (!outTradeNo) return
-
-  const orderCollection = db.collection('xpay_orders')
-  const orderRes = await orderCollection.where({
-    outTradeNo
-  }).limit(1).get()
-
-  if (!orderRes.data || orderRes.data.length === 0) {
-    console.log('markOrderRefundedByPush: order not found, outTradeNo =', outTradeNo)
-    return
-  }
-
-  const order = orderRes.data[0]
-
-  await orderCollection.doc(order._id).update({
-    data: {
-      status: 'REFUNDED',
-      refundPayload: payload,
-      updatedAt: Date.now()
-    }
-  })
-
-  console.log('markOrderRefundedByPush: order updated to REFUNDED, outTradeNo =', outTradeNo)
-}
-
 async function invokeGrantVirtualPack(outTradeNo, productId) {
   const res = await cloud.callFunction({
     name: 'grantVirtualPack',
@@ -205,11 +98,82 @@ async function invokeGrantVirtualPack(outTradeNo, productId) {
   const result = (res && res.result) || {}
   console.log('grantVirtualPack result =', JSON.stringify(result))
 
-  if (!result.success && !result.duplicated) {
-    throw new Error(`grantVirtualPack failed: ${JSON.stringify(result)}`)
+  if (result.success || result.duplicated) {
+    return result
   }
 
-  return result
+  throw new Error(`grantVirtualPack failed: ${JSON.stringify(result)}`)
+}
+
+// 可选：异步记账，不阻塞主发货链路
+async function upsertOrderSnapshot(payload) {
+  try {
+    const outTradeNo = payload.OutTradeNo || ''
+    const openid = payload.OpenId || ''
+    const env = Number(payload.Env || 0)
+    const goodsInfo = payload.GoodsInfo || {}
+    const wxPayInfo = payload.WeChatPayInfo || {}
+
+    if (!outTradeNo) return
+
+    const productId = goodsInfo.ProductId || ''
+    const packCountMap = { pack_5: 5, pack_11: 11, pack_24: 24 }
+    const packCount = packCountMap[productId] || 0
+
+    const orderCollection = db.collection('xpay_orders')
+
+    const orderRes = await orderCollection.where({
+      outTradeNo
+    }).limit(1).get()
+
+    if (!orderRes.data || orderRes.data.length === 0) {
+      await orderCollection.add({
+        data: {
+          outTradeNo,
+          openid,
+          env,
+          productId,
+          buyQuantity: Number(goodsInfo.Quantity || 1),
+          packCount,
+          status: 'PAID',
+          granted: true,
+          grantedAt: Date.now(),
+          transactionId: wxPayInfo.TransactionId || '',
+          mchOrderNo: wxPayInfo.MchOrderNo || '',
+          paidTime: Number(wxPayInfo.PaidTime || 0),
+          actualPrice: Number(goodsInfo.ActualPrice || 0),
+          origPrice: Number(goodsInfo.OrigPrice || 0),
+          attach: goodsInfo.Attach || '',
+          pushPayload: payload,
+          createdFrom: 'callback_direct_grant',
+          updatedAt: Date.now(),
+          createdAt: Date.now()
+        }
+      })
+      console.log('upsertOrderSnapshot add ok, outTradeNo =', outTradeNo)
+      return
+    }
+
+    const order = orderRes.data[0]
+    await orderCollection.doc(order._id).update({
+      data: {
+        status: 'PAID',
+        granted: true,
+        grantedAt: Date.now(),
+        transactionId: wxPayInfo.TransactionId || order.transactionId || '',
+        mchOrderNo: wxPayInfo.MchOrderNo || order.mchOrderNo || '',
+        paidTime: Number(wxPayInfo.PaidTime || order.paidTime || 0),
+        actualPrice: Number(goodsInfo.ActualPrice || order.actualPrice || 0),
+        origPrice: Number(goodsInfo.OrigPrice || order.origPrice || 0),
+        attach: goodsInfo.Attach || order.attach || '',
+        pushPayload: payload,
+        updatedAt: Date.now()
+      }
+    })
+    console.log('upsertOrderSnapshot update ok, outTradeNo =', outTradeNo)
+  } catch (err) {
+    console.error('upsertOrderSnapshot error =', err)
+  }
 }
 
 async function handleGoodsDeliverNotify(payload) {
@@ -225,30 +189,14 @@ async function handleGoodsDeliverNotify(payload) {
     throw new Error('xpay_goods_deliver_notify missing ProductId')
   }
 
-  // 第一步：把订单打成 PAID
-  await markOrderPaidByPush(payload)
+  // 先直接发货 —— 这是主链路
+  const grantResult = await invokeGrantVirtualPack(outTradeNo, productId)
 
-  // 第二步：直接服务端发货
-  await invokeGrantVirtualPack(outTradeNo, productId)
-
-  // 第三步：把订单标记为已发货（grantVirtualPack 本身应保证幂等）
-  const orderCollection = db.collection('xpay_orders')
-  const orderRes = await orderCollection.where({
-    outTradeNo
-  }).limit(1).get()
-
-  if (orderRes.data && orderRes.data.length > 0) {
-    const order = orderRes.data[0]
-    await orderCollection.doc(order._id).update({
-      data: {
-        granted: true,
-        grantedAt: Date.now(),
-        updatedAt: Date.now()
-      }
-    })
-  }
+  // 再异步记账 —— 这是附属链路
+  upsertOrderSnapshot(payload)
 
   console.log('handleGoodsDeliverNotify done, outTradeNo =', outTradeNo)
+  return grantResult
 }
 
 app.get('/', (req, res) => {
@@ -311,7 +259,6 @@ app.post('/wx/callback', async (req, res) => {
         return res.type('application/xml').send(xmlSuccess())
 
       case 'xpay_refund_notify':
-        await markOrderRefundedByPush(payload)
         return res.type('application/xml').send(xmlSuccess())
 
       case 'xpay_coin_pay_notify':
@@ -324,7 +271,7 @@ app.post('/wx/callback', async (req, res) => {
     }
   } catch (err) {
     console.error('POST /wx/callback error =', err)
-    // 关键：发货失败时不要回 success，让微信继续重推
+    // 发货失败，不回 success，让微信继续重推
     return res.type('application/xml').send(xmlFail('server error'))
   }
 })
