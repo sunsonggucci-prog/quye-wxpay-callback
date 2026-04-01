@@ -1,26 +1,20 @@
 const express = require('express')
 const crypto = require('crypto')
 const xml2js = require('xml2js')
-const cloudbase = require('@cloudbase/node-sdk')
+const cloud = require('wx-server-sdk')
 
 const app = express()
 
-// 这里改成你在小程序后台「消息推送配置」里填写的 Token
+// 这里必须和你小程序后台「消息推送配置」里的 Token 一致
 const CALLBACK_TOKEN = 'QYVirtualPay2026'
 
-const ENV_ID =
-  process.env.CLOUDBASE_ENV ||
-  process.env.TCB_ENV ||
-  process.env.SCF_NAMESPACE ||
-  ''
-
-const tcbApp = cloudbase.init({
-  env: ENV_ID
+cloud.init({
+  env: process.env.CLOUDBASE_ENV || process.env.TCB_ENV || cloud.DYNAMIC_CURRENT_ENV
 })
 
-const db = tcbApp.database()
+const db = cloud.database()
 
-// 关键：不要让 express 提前按 json/text 解析，统一先吃原始 body
+// 统一先读取原始 body
 app.use(express.raw({
   type: () => true,
   limit: '2mb'
@@ -78,11 +72,8 @@ async function parseIncomingBody(req) {
   console.log('POST /wx/callback req.body isBuffer =', Buffer.isBuffer(req.body))
   console.log('POST /wx/callback raw body length =', rawBuffer.length)
   console.log('POST /wx/callback raw body preview =', bodyText.slice(0, 1000))
-  console.log('POST /wx/callback raw body base64 preview =', rawBuffer.toString('base64').slice(0, 1000))
 
-  if (!bodyText) {
-    return null
-  }
+  if (!bodyText) return null
 
   if (bodyText.startsWith('{') || bodyText.startsWith('[')) {
     try {
@@ -128,27 +119,28 @@ async function markOrderPaidByPush(payload) {
     outTradeNo
   }).limit(1).get()
 
-  // 推送先到、订单后到的兜底
   if (!orderRes.data || orderRes.data.length === 0) {
     await orderCollection.add({
-      outTradeNo,
-      openid,
-      env,
-      productId,
-      buyQuantity: quantity,
-      packCount: getPackCountByProductId(productId),
-      status: 'PAID',
-      granted: false,
-      transactionId: wxPayInfo.TransactionId || '',
-      mchOrderNo: wxPayInfo.MchOrderNo || '',
-      paidTime: normalizeNumber(wxPayInfo.PaidTime, 0),
-      actualPrice: normalizeNumber(goodsInfo.ActualPrice, 0),
-      origPrice: normalizeNumber(goodsInfo.OrigPrice, 0),
-      attach: goodsInfo.Attach || '',
-      pushPayload: payload,
-      createdFrom: 'push_backfill',
-      updatedAt: Date.now(),
-      createdAt: Date.now()
+      data: {
+        outTradeNo,
+        openid,
+        env,
+        productId,
+        buyQuantity: quantity,
+        packCount: getPackCountByProductId(productId),
+        status: 'PAID',
+        granted: false,
+        transactionId: wxPayInfo.TransactionId || '',
+        mchOrderNo: wxPayInfo.MchOrderNo || '',
+        paidTime: normalizeNumber(wxPayInfo.PaidTime, 0),
+        actualPrice: normalizeNumber(goodsInfo.ActualPrice, 0),
+        origPrice: normalizeNumber(goodsInfo.OrigPrice, 0),
+        attach: goodsInfo.Attach || '',
+        pushPayload: payload,
+        createdFrom: 'push_backfill',
+        updatedAt: Date.now(),
+        createdAt: Date.now()
+      }
     })
 
     console.log('markOrderPaidByPush: order not found, backfill created, outTradeNo =', outTradeNo)
@@ -158,15 +150,17 @@ async function markOrderPaidByPush(payload) {
   const order = orderRes.data[0]
 
   await orderCollection.doc(order._id).update({
-    status: 'PAID',
-    transactionId: wxPayInfo.TransactionId || order.transactionId || '',
-    mchOrderNo: wxPayInfo.MchOrderNo || order.mchOrderNo || '',
-    paidTime: normalizeNumber(wxPayInfo.PaidTime, order.paidTime || 0),
-    actualPrice: normalizeNumber(goodsInfo.ActualPrice, order.actualPrice || 0),
-    origPrice: normalizeNumber(goodsInfo.OrigPrice, order.origPrice || 0),
-    attach: goodsInfo.Attach || order.attach || '',
-    pushPayload: payload,
-    updatedAt: Date.now()
+    data: {
+      status: 'PAID',
+      transactionId: wxPayInfo.TransactionId || order.transactionId || '',
+      mchOrderNo: wxPayInfo.MchOrderNo || order.mchOrderNo || '',
+      paidTime: normalizeNumber(wxPayInfo.PaidTime, order.paidTime || 0),
+      actualPrice: normalizeNumber(goodsInfo.ActualPrice, order.actualPrice || 0),
+      origPrice: normalizeNumber(goodsInfo.OrigPrice, order.origPrice || 0),
+      attach: goodsInfo.Attach || order.attach || '',
+      pushPayload: payload,
+      updatedAt: Date.now()
+    }
   })
 
   console.log('markOrderPaidByPush: order updated to PAID, outTradeNo =', outTradeNo)
@@ -189,9 +183,11 @@ async function markOrderRefundedByPush(payload) {
   const order = orderRes.data[0]
 
   await orderCollection.doc(order._id).update({
-    status: 'REFUNDED',
-    refundPayload: payload,
-    updatedAt: Date.now()
+    data: {
+      status: 'REFUNDED',
+      refundPayload: payload,
+      updatedAt: Date.now()
+    }
   })
 
   console.log('markOrderRefundedByPush: order updated to REFUNDED, outTradeNo =', outTradeNo)
@@ -201,7 +197,7 @@ app.get('/', (req, res) => {
   res.send('quye wxpay callback service running')
 })
 
-// 配置消息推送时微信会先 GET 校验
+// 微信配置消息推送时的 GET 校验
 app.get('/wx/callback', (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query || {}
 
@@ -218,7 +214,7 @@ app.get('/wx/callback', (req, res) => {
   return res.send(echostr || '')
 })
 
-// 正式推送入口
+// 微信正式推送
 app.post('/wx/callback', async (req, res) => {
   try {
     const { signature, timestamp, nonce } = req.query || {}
@@ -240,7 +236,6 @@ app.post('/wx/callback', async (req, res) => {
 
     if (!payload) {
       console.error('POST /wx/callback payload empty')
-      // 不回 success，让微信重推
       return res.type('application/xml').send(xmlFail('payload empty'))
     }
 
@@ -251,7 +246,6 @@ app.post('/wx/callback', async (req, res) => {
 
     if (!eventName) {
       console.error('POST /wx/callback Event empty')
-      // 不回 success，让微信重推
       return res.type('application/xml').send(xmlFail('event empty'))
     }
 
