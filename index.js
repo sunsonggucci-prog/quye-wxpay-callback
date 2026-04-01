@@ -5,10 +5,8 @@ const cloudbase = require('@cloudbase/node-sdk')
 
 const app = express()
 
-// 这里改成你消息推送配置里用的 Token
 const CALLBACK_TOKEN = 'QYVirtualPay2026'
 
-// 云开发环境 ID：优先取系统环境变量
 const ENV_ID =
   process.env.CLOUDBASE_ENV ||
   process.env.TCB_ENV ||
@@ -20,12 +18,12 @@ const tcbApp = cloudbase.init({
 })
 
 const db = tcbApp.database()
-const _ = db.command
 
-// 微信消息推送可能发 XML，这里同时支持 text / json / urlencoded
-app.use(express.text({ type: ['text/*', 'application/xml', 'application/json', '*/*'] }))
-app.use(express.json({ limit: '1mb' }))
-app.use(express.urlencoded({ extended: false }))
+// 关键：统一先按 raw 读取，后面自己解析
+app.use(express.raw({
+  type: '*/*',
+  limit: '2mb'
+}))
 
 function sha1(str) {
   return crypto.createHash('sha1').update(str).digest('hex')
@@ -34,45 +32,6 @@ function sha1(str) {
 function checkWechatSignature(signature, timestamp, nonce) {
   const arr = [CALLBACK_TOKEN, timestamp, nonce].sort()
   return sha1(arr.join('')) === signature
-}
-
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text)
-  } catch (e) {
-    return null
-  }
-}
-
-async function parseIncomingBody(req) {
-  const contentType = (req.headers['content-type'] || '').toLowerCase()
-
-  if (contentType.includes('application/json')) {
-    return req.body || {}
-  }
-
-  const bodyText =
-    typeof req.body === 'string'
-      ? req.body
-      : Buffer.isBuffer(req.body)
-      ? req.body.toString('utf8')
-      : ''
-
-  if (!bodyText) return {}
-
-  if (bodyText.trim().startsWith('{')) {
-    return safeJsonParse(bodyText) || {}
-  }
-
-  if (bodyText.trim().startsWith('<xml') || bodyText.trim().startsWith('<')) {
-    const result = await xml2js.parseStringPromise(bodyText, {
-      explicitArray: false,
-      trim: true
-    })
-    return result && result.xml ? result.xml : result
-  }
-
-  return {}
 }
 
 function xmlSuccess() {
@@ -97,6 +56,53 @@ function getPackCountByProductId(productId) {
   return map[productId] || 0
 }
 
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    return null
+  }
+}
+
+async function parseIncomingBody(req) {
+  const rawBody = Buffer.isBuffer(req.body)
+    ? req.body.toString('utf8')
+    : typeof req.body === 'string'
+      ? req.body
+      : ''
+
+  const bodyText = (rawBody || '').trim()
+
+  console.log('POST /wx/callback headers =', JSON.stringify(req.headers))
+  console.log('POST /wx/callback raw body text =', bodyText)
+
+  if (!bodyText) {
+    return null
+  }
+
+  // JSON
+  if (bodyText.startsWith('{') || bodyText.startsWith('[')) {
+    const jsonObj = tryParseJson(bodyText)
+    if (jsonObj) return jsonObj
+  }
+
+  // XML
+  if (bodyText.startsWith('<')) {
+    try {
+      const xmlRes = await xml2js.parseStringPromise(bodyText, {
+        explicitArray: false,
+        trim: true
+      })
+      return xmlRes && xmlRes.xml ? xmlRes.xml : xmlRes
+    } catch (err) {
+      console.error('xml parse error =', err)
+      return null
+    }
+  }
+
+  return null
+}
+
 async function markOrderPaidByPush(payload) {
   const outTradeNo = payload.OutTradeNo
   const openid = payload.OpenId
@@ -107,13 +113,16 @@ async function markOrderPaidByPush(payload) {
   const productId = goodsInfo.ProductId || ''
   const quantity = normalizeNumber(goodsInfo.Quantity, 1)
 
+  if (!outTradeNo) {
+    throw new Error('OutTradeNo 缺失')
+  }
+
   const orderCollection = db.collection('xpay_orders')
   const orderRes = await orderCollection.where({
     outTradeNo
   }).limit(1).get()
 
   if (!orderRes.data || orderRes.data.length === 0) {
-    // 找不到订单也先写一条，避免推送丢失
     await orderCollection.add({
       outTradeNo,
       openid,
@@ -138,6 +147,7 @@ async function markOrderPaidByPush(payload) {
   }
 
   const order = orderRes.data[0]
+
   await orderCollection.doc(order._id).update({
     status: 'PAID',
     transactionId: wxPayInfo.TransactionId || order.transactionId || '',
@@ -174,7 +184,6 @@ app.get('/', (req, res) => {
   res.send('quye wxpay callback service running')
 })
 
-// 微信消息推送首次配置校验
 app.get('/wx/callback', (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query || {}
 
@@ -191,13 +200,11 @@ app.get('/wx/callback', (req, res) => {
   return res.send(echostr || '')
 })
 
-// 微信消息推送正式回调
 app.post('/wx/callback', async (req, res) => {
   try {
     const { signature, timestamp, nonce } = req.query || {}
 
     console.log('POST /wx/callback query =', req.query)
-    console.log('POST /wx/callback raw body =', req.body)
 
     if (!signature || !timestamp || !nonce) {
       return res.type('application/xml').send(xmlFail('missing signature params'))
@@ -209,9 +216,21 @@ app.post('/wx/callback', async (req, res) => {
 
     const payload = await parseIncomingBody(req)
 
+    if (!payload) {
+      console.error('POST /wx/callback payload empty')
+      // 关键：这里不能返回 success，要让微信重推
+      return res.type('application/xml').send(xmlFail('payload empty'))
+    }
+
     console.log('POST /wx/callback parsed payload =', JSON.stringify(payload))
 
     const eventName = payload.Event || ''
+
+    if (!eventName) {
+      console.error('POST /wx/callback Event empty')
+      // 关键：这里也不能返回 success，要让微信重推
+      return res.type('application/xml').send(xmlFail('event empty'))
+    }
 
     switch (eventName) {
       case 'xpay_goods_deliver_notify':
@@ -224,9 +243,11 @@ app.post('/wx/callback', async (req, res) => {
 
       case 'xpay_coin_pay_notify':
       case 'xpay_complaint_notify':
-      default:
-        // 先回成功，避免微信重推
         return res.type('application/xml').send(xmlSuccess())
+
+      default:
+        console.error('POST /wx/callback unsupported event =', eventName)
+        return res.type('application/xml').send(xmlFail('unsupported event'))
     }
   } catch (err) {
     console.error('POST /wx/callback error =', err)
