@@ -5,7 +5,7 @@ const cloud = require('wx-server-sdk')
 
 const app = express()
 
-// 这里必须和你小程序后台「消息推送配置」里的 Token 一致
+// 必须和小程序后台「消息推送配置」里的 Token 完全一致
 const CALLBACK_TOKEN = 'QYVirtualPay2026'
 
 cloud.init({
@@ -14,7 +14,6 @@ cloud.init({
 
 const db = cloud.database()
 
-// 统一先读取原始 body
 app.use(express.raw({
   type: () => true,
   limit: '2mb'
@@ -72,6 +71,7 @@ async function parseIncomingBody(req) {
   console.log('POST /wx/callback req.body isBuffer =', Buffer.isBuffer(req.body))
   console.log('POST /wx/callback raw body length =', rawBuffer.length)
   console.log('POST /wx/callback raw body preview =', bodyText.slice(0, 1000))
+  console.log('POST /wx/callback raw body base64 preview =', rawBuffer.toString('base64').slice(0, 1000))
 
   if (!bodyText) return null
 
@@ -193,11 +193,68 @@ async function markOrderRefundedByPush(payload) {
   console.log('markOrderRefundedByPush: order updated to REFUNDED, outTradeNo =', outTradeNo)
 }
 
+async function invokeGrantVirtualPack(outTradeNo, productId) {
+  const res = await cloud.callFunction({
+    name: 'grantVirtualPack',
+    data: {
+      outTradeNo,
+      productId
+    }
+  })
+
+  const result = (res && res.result) || {}
+  console.log('grantVirtualPack result =', JSON.stringify(result))
+
+  if (!result.success && !result.duplicated) {
+    throw new Error(`grantVirtualPack failed: ${JSON.stringify(result)}`)
+  }
+
+  return result
+}
+
+async function handleGoodsDeliverNotify(payload) {
+  const outTradeNo = payload.OutTradeNo || ''
+  const goodsInfo = payload.GoodsInfo || {}
+  const productId = goodsInfo.ProductId || ''
+
+  if (!outTradeNo) {
+    throw new Error('xpay_goods_deliver_notify missing OutTradeNo')
+  }
+
+  if (!productId) {
+    throw new Error('xpay_goods_deliver_notify missing ProductId')
+  }
+
+  // 第一步：把订单打成 PAID
+  await markOrderPaidByPush(payload)
+
+  // 第二步：直接服务端发货
+  await invokeGrantVirtualPack(outTradeNo, productId)
+
+  // 第三步：把订单标记为已发货（grantVirtualPack 本身应保证幂等）
+  const orderCollection = db.collection('xpay_orders')
+  const orderRes = await orderCollection.where({
+    outTradeNo
+  }).limit(1).get()
+
+  if (orderRes.data && orderRes.data.length > 0) {
+    const order = orderRes.data[0]
+    await orderCollection.doc(order._id).update({
+      data: {
+        granted: true,
+        grantedAt: Date.now(),
+        updatedAt: Date.now()
+      }
+    })
+  }
+
+  console.log('handleGoodsDeliverNotify done, outTradeNo =', outTradeNo)
+}
+
 app.get('/', (req, res) => {
   res.send('quye wxpay callback service running')
 })
 
-// 微信配置消息推送时的 GET 校验
 app.get('/wx/callback', (req, res) => {
   const { signature, timestamp, nonce, echostr } = req.query || {}
 
@@ -214,7 +271,6 @@ app.get('/wx/callback', (req, res) => {
   return res.send(echostr || '')
 })
 
-// 微信正式推送
 app.post('/wx/callback', async (req, res) => {
   try {
     const { signature, timestamp, nonce } = req.query || {}
@@ -251,7 +307,7 @@ app.post('/wx/callback', async (req, res) => {
 
     switch (eventName) {
       case 'xpay_goods_deliver_notify':
-        await markOrderPaidByPush(payload)
+        await handleGoodsDeliverNotify(payload)
         return res.type('application/xml').send(xmlSuccess())
 
       case 'xpay_refund_notify':
@@ -268,6 +324,7 @@ app.post('/wx/callback', async (req, res) => {
     }
   } catch (err) {
     console.error('POST /wx/callback error =', err)
+    // 关键：发货失败时不要回 success，让微信继续重推
     return res.type('application/xml').send(xmlFail('server error'))
   }
 })
